@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""
+umap_multi_sets.py
+
+Compute a shared 2D UMAP embedding for MULTIPLE SMILES sets to visualize overlap.
+Saves a combined CSV and a bold, publication-style plot.
+
+Examples
+--------
+# Same size for all sets
+python umap_multi_sets.py \
+  --in A.smi B.smi \
+  --labels A B \
+  --markersize 36 \
+  --outdir out --save-png --save-csv
+
+# Per-set sizes, colors, markers, alphas
+python umap_multi_sets.py \
+  --in lib1.smi lib2.smi lib3.smi \
+  --labels Lib1 Lib2 Lib3 \
+  --markers o x ^ \
+  --colors red blue green \
+  --alpha 0.3 0.7 1.0 \
+  --markersize 20 60 100 \
+  --edgecolor none --edgewidth 0 \
+  --legend --legend-cols 3 \
+  --outdir out --save-svg --save-csv
+"""
+
+import argparse
+import csv
+from pathlib import Path
+import math
+
+import numpy as np
+import pandas as pd
+
+from rdkit import Chem
+from rdkit.Chem import AllChem, rdMolDescriptors, RDKFingerprint
+
+from sklearn.decomposition import PCA
+
+import umap  # UMAP
+
+# Optional: progress bars
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(x, **kwargs): return x
+
+# -------------------- IO helpers --------------------
+def read_table(path, smiles_col=0, sep=None, infer_delim=False):
+    """Read a table with SMILES in a given column (default: whitespace, col 0)."""
+    if infer_delim:
+        df = pd.read_csv(path, sep=None, engine="python", header=None, dtype=str, quoting=csv.QUOTE_NONE)
+    elif sep is not None:
+        use_engine = "python" if isinstance(sep, str) and ("\\" in sep or sep is None) else None
+        df = pd.read_csv(path, sep=sep, engine=use_engine, header=None, dtype=str, quoting=csv.QUOTE_NONE)
+    else:
+        df = pd.read_csv(path, sep=r"\s+", engine="python", header=None, dtype=str, quoting=csv.QUOTE_NONE)
+    df = df.replace({np.nan: None})
+    ncols = df.shape[1]
+    idx = smiles_col if smiles_col >= 0 else ncols + smiles_col
+    if idx < 0 or idx >= ncols:
+        raise IndexError(f"--smiles-col {smiles_col} out of bounds for {ncols} columns")
+    return df.iloc[:, idx].astype(str).tolist()
+
+def smiles_to_mols(smiles_list, canonicalize=False):
+    mols, outs = [], []
+    for s in smiles_list:
+        s0 = "" if s is None else str(s).strip()
+        if not s0:
+            mols.append(None); outs.append("")
+            continue
+        m = Chem.MolFromSmiles(s0)
+        if m is None:
+            mols.append(None); outs.append(s0)
+            continue
+        if canonicalize:
+            try:
+                s0 = Chem.MolToSmiles(m, canonical=True)
+            except Exception:
+                pass
+        mols.append(m); outs.append(s0)
+    return mols, outs
+
+# -------------------- Fingerprints --------------------
+def fp_morgan(mol, nBits=2048, radius=2):
+    if mol is None: return None
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nBits)
+
+def fp_rdkit(mol, nBits=2048):
+    if mol is None: return None
+    return RDKFingerprint(mol, fpSize=nBits)
+
+def fp_atompair(mol, nBits=2048):
+    if mol is None: return None
+    return rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(mol, nBits=nBits)
+
+def fps_to_numpy(bitvecs):
+    """ExplicitBitVect -> numpy uint8 (0/1)."""
+    nbits = bitvecs[0].GetNumBits()
+    arr = np.zeros((len(bitvecs), nbits), dtype=np.uint8)
+    for i, bv in enumerate(bitvecs):
+        if bv is None: continue
+        onbits = list(bv.GetOnBits())
+        arr[i, onbits] = 1
+    return arr
+
+# -------------------- Plot styling --------------------
+import matplotlib
+import matplotlib.pyplot as plt
+
+def apply_bold_matplotlib(fontsize=12, title_size=14, tick_size=11, legend_size=11,
+                          axis_linewidth=1.8, tick_width=1.8):
+    matplotlib.rcParams.update({
+        "font.weight": "bold",
+        "axes.labelweight": "bold",
+        "axes.titleweight": "bold",
+        "axes.linewidth": axis_linewidth,
+        "xtick.major.width": tick_width,
+        "ytick.major.width": tick_width,
+        "xtick.labelsize": tick_size,
+        "ytick.labelsize": tick_size,
+        "axes.titlesize": title_size,
+        "axes.labelsize": fontsize,
+        "legend.fontsize": legend_size,
+    })
+
+def normalize_option_list(opt_list, nsets, name):
+    """
+    Normalize an option that may be:
+    - None -> return None
+    - single scalar -> broadcast to nsets
+    - list len==nsets -> as-is
+    - other length -> cycle to nsets
+    """
+    if opt_list is None:
+        return None
+    if not isinstance(opt_list, (list, tuple, np.ndarray)):
+        return [opt_list] * nsets
+    if len(opt_list) == 0:
+        return None
+    if len(opt_list) == 1:
+        return [opt_list[0]] * nsets
+    if len(opt_list) == nsets:
+        return list(opt_list)
+    return [opt_list[i % len(opt_list)] for i in range(nsets)]
+
+def plot_overlay(emb_list, set_names, colors=None, markers=None, alphas=None, markersizes=None,
+                 title="UMAP overlap", figsize=(8,6),
+                 edgecolor="k", edgewidth=0.4,
+                 legend=True, legend_loc="best", legend_cols=1):
+    """
+    emb_list: list of (Ni,2) arrays per set
+    set_names: list of names for legend
+    colors/markers/alphas/markersizes: lists per set (broadcast/cycle handled)
+    """
+    nsets = len(emb_list)
+    if colors is None:
+        cmap = plt.get_cmap("tab10")
+        colors = [cmap(i % cmap.N) for i in range(nsets)]
+    if markers is None:
+        base = ["o", "x", "^", "s", "D", "v", "P", "*", "<", ">"]
+        markers = [base[i % len(base)] for i in range(nsets)]
+    if alphas is None:
+        alphas = [0.9] * nsets
+    if markersizes is None:
+        markersizes = [20] * nsets  # Matplotlib size units are points^2
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=100)
+    handles = []
+    for i in range(nsets):
+        emb = emb_list[i]
+        if emb.size == 0:
+            continue
+        h = ax.scatter(
+            emb[:,0], emb[:,1],
+            s=float(markersizes[i]),
+            marker=markers[i],
+            alpha=float(alphas[i]),
+            edgecolor=edgecolor, linewidth=edgewidth,
+            color=colors[i], label=set_names[i]
+        )
+        handles.append(h)
+
+    ax.set_xlabel("UMAP 1")
+    ax.set_ylabel("UMAP 2")
+    ax.set_title(title)
+    ax.grid(True, linewidth=0.8, alpha=0.3)
+
+    if legend:
+        ax.legend(ncol=legend_cols, loc=legend_loc, frameon=False)
+
+    fig.tight_layout()
+    return fig, ax
+
+# -------------------- Main --------------------
+def main():
+    ap = argparse.ArgumentParser(description="UMAP overlap for multiple SMILES sets (bold plotting).")
+
+    # Inputs
+    ap.add_argument("--in", dest="infiles", nargs="+", required=True,
+                    help="Input files (>=2). Each contains SMILES in column 0 by default.")
+    ap.add_argument("--labels", nargs="+", default=None,
+                    help="Labels per input (for legend). Defaults to file basenames.")
+    ap.add_argument("--smiles-col", type=int, default=0,
+                    help="SMILES column index (0-based) for ALL inputs.")
+    ap.add_argument("--sep", default=None,
+                    help="Delimiter for ALL inputs. Default: None (whitespace). Use --infer-delim for auto.")
+    ap.add_argument("--infer-delim", action="store_true",
+                    help="Infer delimiter automatically (pandas engine='python').")
+    ap.add_argument("--canonicalize", action="store_true",
+                    help="Canonicalize SMILES before featurization.")
+    ap.add_argument("--max-n", type=int, default=None,
+                    help="Optionally sample first N molecules from EACH set (speed/debug).")
+
+    # Fingerprints
+    ap.add_argument("--fp", choices=["morgan","rdkit","atompair"], default="morgan",
+                    help="Fingerprint type.")
+    ap.add_argument("--fp-bits", type=int, default=2048, help="FP bit size.")
+    ap.add_argument("--fp-radius", type=int, default=2, help="Morgan radius (if --fp morgan).")
+
+    # PCA + UMAP
+    ap.add_argument("--pca", type=int, default=50, help="PCA components before UMAP (0 to disable).")
+    ap.add_argument("--n-neighbors", type=int, default=30, help="UMAP n_neighbors.")
+    ap.add_argument("--min-dist", type=float, default=0.1, help="UMAP min_dist.")
+    ap.add_argument("--metric", default="euclidean",
+                    help="UMAP metric (e.g., euclidean, jaccard for binary).")
+    ap.add_argument("--random-state", type=int, default=0, help="Random seed.")
+    ap.add_argument("--n-epochs", type=int, default=None, help="UMAP n_epochs (None = auto).")
+    ap.add_argument("--learning-rate", type=float, default=1.0, help="UMAP learning rate.")
+    ap.add_argument("--verbose", action="store_true", help="UMAP verbose output.")
+
+    # Plot styling
+    ap.add_argument("--title", default="UMAP overlap", help="Plot title.")
+    ap.add_argument("--figsize", type=float, nargs=2, default=(8,6), help="Figure size W H (in).")
+    ap.add_argument("--colors", nargs="+", default=None, help="Colors per set (e.g., red blue '#2ca02c').")
+    ap.add_argument("--markers", nargs="+", default=None, help="Markers per set (e.g., o x ^).")
+    ap.add_argument("--alpha", nargs="+", type=float, default=[0.9],
+                    help="Point alpha (one value for all sets or a list, e.g., 0.3 0.7 1.0).")
+    # NEW: per-set marker sizes
+    ap.add_argument("--markersize", nargs="+", type=float, default=[20],
+                    help="Marker size(s) in points^2 (one value for all sets or a list, e.g., 20 60 100).")
+    ap.add_argument("--edgewidth", type=float, default=0.4, help="Point edge line width.")
+    ap.add_argument("--edgecolor", default="k", help="Point edge color ('none' to disable outlines).")
+    ap.add_argument("--legend", action="store_true", help="Show legend.")
+    ap.add_argument("--legend-loc", default="best", help="Legend location.")
+    ap.add_argument("--legend-cols", type=int, default=1, help="Legend columns.")
+
+    # Bold text/lines
+    ap.add_argument("--fontsize", type=int, default=12, help="Axis label font size (bold).")
+    ap.add_argument("--title-size", type=int, default=14, help="Title font size (bold).")
+    ap.add_argument("--tick-size", type=int, default=11, help="Tick font size (bold).")
+    ap.add_argument("--legend-size", type=int, default=11, help="Legend font size.")
+    ap.add_argument("--axis-linewidth", type=float, default=1.8, help="Axes line width (bold).")
+    ap.add_argument("--tick-width", type=float, default=1.8, help="Tick line width (bold).")
+
+    # Output
+    ap.add_argument("--outdir", required=True, help="Output directory.")
+    ap.add_argument("--basename", default=None, help="Base filename (default auto).")
+    ap.add_argument("--save-png", action="store_true", help="Save PNG.")
+    ap.add_argument("--save-svg", action="store_true", help="Save SVG.")
+    ap.add_argument("--dpi", type=int, default=300, help="PNG DPI.")
+    ap.add_argument("--save-csv", action="store_true", help="Save combined CSV.")
+
+    args = ap.parse_args()
+    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+
+    # Labels default to basenames
+    if args.labels is None:
+        args.labels = [Path(p).stem for p in args.infiles]
+    if len(args.labels) != len(args.infiles):
+        raise ValueError("--labels must match the number of --in files")
+
+    # Read all sets
+    smiles_sets, mols_sets, smiles_out_sets = [], [], []
+    for p in args.infiles:
+        smi = read_table(p, smiles_col=args.smiles_col, sep=args.sep, infer_delim=args.infer_delim)
+        if args.max_n is not None and args.max_n > 0:
+            smi = smi[:args.max_n]
+        mols, outs = smiles_to_mols(smi, canonicalize=args.canonicalize)
+        smiles_sets.append(smi); mols_sets.append(mols); smiles_out_sets.append(outs)
+
+    # Fingerprints per set
+    fps_sets, okidx_sets = [], []
+    for mols in mols_sets:
+        ok_idx = [i for i, m in enumerate(mols) if m is not None]
+        okidx_sets.append(ok_idx)
+        if not ok_idx:
+            fps_sets.append(np.zeros((0, args.fp_bits), dtype=np.uint8)); continue
+        bitvecs = []
+        it = tqdm(ok_idx, desc=f"FP ({args.fp})", unit="mol")
+        if args.fp == "morgan":
+            for i in it: bitvecs.append(fp_morgan(mols[i], nBits=args.fp_bits, radius=args.fp_radius))
+        elif args.fp == "rdkit":
+            for i in it: bitvecs.append(fp_rdkit(mols[i], nBits=args.fp_bits))
+        else:
+            for i in it: bitvecs.append(fp_atompair(mols[i], nBits=args.fp_bits))
+        X = fps_to_numpy(bitvecs).astype(np.float32)
+        fps_sets.append(X)
+
+    # Concatenate for shared embedding
+    X_all = np.concatenate([X for X in fps_sets if X.size > 0], axis=0) if any(X.size>0 for X in fps_sets) else None
+    if X_all is None or X_all.shape[0] == 0:
+        raise RuntimeError("No valid molecules across inputs.")
+
+    # PCA pre-reduction (optional)
+    if args.pca and args.pca > 0 and args.pca < X_all.shape[1]:
+        pca = PCA(n_components=args.pca, random_state=args.random_state)
+        X_all_red = pca.fit_transform(X_all)
+        splits = []
+        for X in fps_sets:
+            n = X.shape[0]
+            if n == 0:
+                splits.append(np.zeros((0, args.pca), dtype=np.float32)); continue
+            splits.append(X_all_red[:n]); X_all_red = X_all_red[n:]
+        X_sets_red = splits
+    else:
+        X_sets_red = fps_sets
+
+    # UMAP (fit once on merged, then split)
+    X_merged = np.concatenate(X_sets_red, axis=0)
+    reducer = umap.UMAP(
+        n_neighbors=args.n_neighbors,
+        min_dist=args.min_dist,
+        n_components=2,
+        metric=args.metric,
+        random_state=args.random_state,
+        n_epochs=args.n_epochs,
+        learning_rate=args.learning_rate,
+        verbose=args.verbose,
+    )
+    emb_merged = reducer.fit_transform(X_merged)
+
+    emb_sets, idx = [], 0
+    for X in X_sets_red:
+        n = X.shape[0]
+        emb_sets.append(emb_merged[idx:idx+n] if n>0 else np.zeros((0,2)))
+        idx += n
+
+    # Combined CSV
+    base = args.basename or f"umap_{args.fp}{'' if args.fp!='morgan' else f'r{args.fp_radius}'}_{args.fp_bits}b_pca{args.pca}_nn{args.n_neighbors}_md{str(args.min_dist).replace('.','p')}"
+    if args.save_csv:
+        rows = []
+        for label, smiles_out, ok_idx, emb in zip(args.labels, smiles_out_sets, okidx_sets, emb_sets):
+            coords = np.full((len(smiles_out), 2), np.nan, dtype=float)
+            for j, irow in enumerate(ok_idx):
+                coords[irow] = emb[j]
+            for irow, sm in enumerate(smiles_out):
+                rows.append({"set": label, "SMILES": sm, "umap_x": coords[irow,0], "umap_y": coords[irow,1]})
+        pd.DataFrame(rows, columns=["set","SMILES","umap_x","umap_y"]).to_csv(Path(args.outdir)/f"{base}.csv", index=False)
+
+    # Normalize style lists to #sets
+    nsets = len(args.infiles)
+    colors     = normalize_option_list(args.colors, nsets, "colors")
+    markers    = normalize_option_list(args.markers, nsets, "markers")
+    alphas     = normalize_option_list(args.alpha,  nsets, "alpha")
+    markersizes= normalize_option_list(args.markersize, nsets, "markersize")
+
+    # Plot
+    apply_bold_matplotlib(
+        fontsize=args.fontsize, title_size=args.title_size, tick_size=args.tick_size,
+        legend_size=args.legend_size, axis_linewidth=args.axis_linewidth, tick_width=args.tick_width
+    )
+    fig, ax = plot_overlay(
+        emb_sets, set_names=args.labels,
+        colors=colors, markers=markers, alphas=alphas, markersizes=markersizes,
+        title=args.title, figsize=tuple(args.figsize),
+        edgecolor=args.edgecolor, edgewidth=args.edgewidth,
+        legend=args.legend, legend_loc=args.legend_loc, legend_cols=args.legend_cols
+    )
+
+    if args.save_png:
+        fig.savefig(Path(args.outdir)/f"{base}.png", dpi=args.dpi, bbox_inches="tight")
+    if args.save_svg:
+        fig.savefig(Path(args.outdir)/f"{base}.svg", bbox_inches="tight")
+
+    if not args.save_png and not args.save_svg:
+        plt.show()
+
+if __name__ == "__main__":
+    main()
